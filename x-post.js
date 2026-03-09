@@ -43,6 +43,7 @@ const { chromium } = require('./node_modules/playwright');
 const fs = require('fs');
 const path = require('path');
 const os = require('os');
+const readline = require('readline');
 
 // ---------------------------------------------------------------------------
 // Security constants
@@ -143,6 +144,63 @@ async function verifyCt0(page) {
   }
 }
 
+/**
+ * Fetch the screen_name of the currently logged-in account via internal API.
+ * Returns "@username" or null on failure.
+ */
+async function getLoggedInUser(page) {
+  return page.evaluate(async (bearer) => {
+    const ct0Entry = document.cookie.split(';').map(c => c.trim()).find(c => c.startsWith('ct0='));
+    if (!ct0Entry) return null;
+    const csrfToken = ct0Entry.split('=')[1];
+    try {
+      const res = await fetch('https://x.com/i/api/1.1/account/settings.json', {
+        credentials: 'include',
+        headers: {
+          'authorization': `Bearer ${bearer}`,
+          'x-csrf-token': csrfToken,
+          'x-twitter-auth-type': 'OAuth2Session',
+          'x-twitter-active-user': 'yes',
+        },
+      });
+      if (!res.ok) return null;
+      const data = await res.json();
+      return data.screen_name || null;
+    } catch {
+      return null;
+    }
+  }, BEARER_TOKEN);
+}
+
+/**
+ * Interactively update auth_token file (account initialization).
+ * Reads token from stdin to avoid shell history exposure.
+ */
+async function runSetToken() {
+  const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+  console.log(`auth_token will be saved to: ${AUTH_TOKEN_PATH}`);
+  const token = await new Promise((resolve) => {
+    rl.question('Paste your auth_token (from Chrome DevTools > Application > Cookies > auth_token): ', (answer) => {
+      rl.close();
+      resolve(answer.trim());
+    });
+  });
+
+  if (!token) {
+    console.error('ERROR: No token provided');
+    process.exit(1);
+  }
+
+  const dir = path.dirname(AUTH_TOKEN_PATH);
+  if (!fs.existsSync(dir)) {
+    fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+  }
+
+  fs.writeFileSync(AUTH_TOKEN_PATH, token + '\n', { mode: 0o600 });
+  console.log(`auth_token saved to ${AUTH_TOKEN_PATH} (permissions: 0600)`);
+  console.log('Run "node x-post.js --whoami" to verify the account.');
+}
+
 // ---------------------------------------------------------------------------
 // Chrome binary detection
 // ---------------------------------------------------------------------------
@@ -169,7 +227,7 @@ function parseArgs() {
   const argv = process.argv.slice(2);
 
   const config = {
-    mode: 'tweet',        // 'tweet' | 'reply' | 'retweet' | 'quote' | 'thread'
+    mode: 'tweet',        // 'tweet' | 'reply' | 'retweet' | 'quote' | 'thread' | 'whoami' | 'set-token'
     texts: [],            // positional tweet text(s)
     replyUrl: null,
     retweetUrl: null,
@@ -184,7 +242,13 @@ function parseArgs() {
   while (i < argv.length) {
     const arg = argv[i];
 
-    if (arg === '--dry-run') {
+    if (arg === '--whoami') {
+      config.mode = 'whoami';
+      i++;
+    } else if (arg === '--set-token') {
+      config.mode = 'set-token';
+      i++;
+    } else if (arg === '--dry-run') {
       config.dryRun = true;
       i++;
     } else if (arg === '--no-headless') {
@@ -225,6 +289,10 @@ function parseArgs() {
   }
 
   // Validate
+  if (config.mode === 'whoami' || config.mode === 'set-token') {
+    return config;
+  }
+
   if (config.mode === 'retweet') {
     if (!config.retweetUrl) {
       console.error('ERROR: --retweet requires a tweet URL');
@@ -274,8 +342,12 @@ Usage:
   node x-post.js --retweet <tweet-url>
   node x-post.js --quote <tweet-url> "comment"
   node x-post.js --dry-run "text"
+  node x-post.js --whoami
+  node x-post.js --set-token
 
 Options:
+  --whoami           Show which account is currently logged in, then exit
+  --set-token        Update auth_token interactively (account initialization)
   --reply <url>      Reply to the tweet at given URL
   --retweet <url>    Retweet the tweet at given URL
   --quote <url>      Quote-tweet with comment
@@ -618,6 +690,12 @@ async function runThread(page, texts, queryIds, bearer) {
 async function main() {
   const config = parseArgs();
 
+  // --- set-token mode: no browser needed ---
+  if (config.mode === 'set-token') {
+    await runSetToken();
+    return;
+  }
+
   // --- Dry run mode ---
   if (config.dryRun) {
     console.log('=== DRY RUN ===');
@@ -697,6 +775,18 @@ async function main() {
     // --- Security gates ---
     checkAuthExpiry(page);  // invariant 7: detect login redirect
     await verifyCt0(page);  // invariant 6: ct0 must be present
+
+    // --- Account verification ---
+    const screenName = await getLoggedInUser(page);
+    if (screenName) {
+      console.log(`Logged in as: @${screenName}`);
+    } else {
+      console.warn('WARNING: Could not determine logged-in account. Proceeding anyway.');
+    }
+
+    if (config.mode === 'whoami') {
+      return;
+    }
 
     // --- Extract GraphQL queryIds ---
     console.log('Extracting GraphQL queryIds from JS bundles...');
