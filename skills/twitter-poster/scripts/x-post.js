@@ -353,6 +353,18 @@ function parseArgs() {
     }
   }
 
+  // Validate tweet length (280 char limit)
+  const MAX_TWEET_LENGTH = 280;
+  const textsToCheck = ['tweet', 'reply', 'quote', 'thread'].includes(config.mode) ? config.texts : [];
+  for (let i = 0; i < textsToCheck.length; i++) {
+    const len = textsToCheck[i].length;
+    if (len > MAX_TWEET_LENGTH) {
+      const label = config.mode === 'thread' ? `Thread tweet ${i + 1}` : 'Tweet';
+      console.error(`ERROR: ${label} exceeds 280 characters (${len} chars)`);
+      process.exit(1);
+    }
+  }
+
   return config;
 }
 
@@ -958,8 +970,16 @@ async function main() {
           if (result.data) console.error(JSON.stringify(result.data, null, 2));
           process.exit(1);
         }
+        if (result.data?.errors?.length) {
+          console.error('ERROR (GraphQL):', JSON.stringify(result.data.errors, null, 2));
+          process.exit(1);
+        }
         const tweetId = extractPostedTweetId(result.data);
-        console.log(`Tweet posted successfully${tweetId ? ` (id=${tweetId})` : ''}`);
+        if (!tweetId) {
+          console.error('ERROR: tweet ID not found in response:', JSON.stringify(result.data, null, 2));
+          process.exit(1);
+        }
+        console.log(`Tweet posted successfully (id=${tweetId})`);
         break;
       }
 
