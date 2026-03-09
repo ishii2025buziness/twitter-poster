@@ -12,7 +12,7 @@ description: >
 ## Script
 
 ```
-/home/kento/projects/0309/twitter-poster/x-post.js
+/home/kento/projects/0309/twitter-poster/skills/twitter-poster/scripts/x-post.js
 ```
 
 auth_token: `~/.twitter-export/auth_token` (0600) — 設定済み。
@@ -21,31 +21,31 @@ auth_token: `~/.twitter-export/auth_token` (0600) — 設定済み。
 
 ```bash
 # テキスト投稿
-node /home/kento/projects/0309/twitter-poster/x-post.js "テキスト"
+node /home/kento/projects/0309/twitter-poster/skills/twitter-poster/scripts/x-post.js "テキスト"
 
 # リプライ
-node /home/kento/projects/0309/twitter-poster/x-post.js --reply <tweet-url> "返信テキスト"
+node /home/kento/projects/0309/twitter-poster/skills/twitter-poster/scripts/x-post.js --reply <tweet-url> "返信テキスト"
 
 # リツイート
-node /home/kento/projects/0309/twitter-poster/x-post.js --retweet <tweet-url>
+node /home/kento/projects/0309/twitter-poster/skills/twitter-poster/scripts/x-post.js --retweet <tweet-url>
 
 # 引用リツイート
-node /home/kento/projects/0309/twitter-poster/x-post.js --quote <tweet-url> "コメント"
+node /home/kento/projects/0309/twitter-poster/skills/twitter-poster/scripts/x-post.js --quote <tweet-url> "コメント"
 
 # スレッド（引数ごとに1ツイート）
-node /home/kento/projects/0309/twitter-poster/x-post.js --thread "1ツ目" "2つ目" "3つ目"
+node /home/kento/projects/0309/twitter-poster/skills/twitter-poster/scripts/x-post.js --thread "1ツ目" "2つ目" "3つ目"
 
 # 画像付き（最大4枚）、動画付き（1本）
-node /home/kento/projects/0309/twitter-poster/x-post.js --media /path/to/file.jpg "キャプション"
+node /home/kento/projects/0309/twitter-poster/skills/twitter-poster/scripts/x-post.js --media /path/to/file.jpg "キャプション"
 
 # dry-run（確認のみ、実際には投稿しない）
-node /home/kento/projects/0309/twitter-poster/x-post.js --dry-run "テスト"
+node /home/kento/projects/0309/twitter-poster/skills/twitter-poster/scripts/x-post.js --dry-run "テスト"
 
 # 現在ログイン中のアカウントを確認
-node /home/kento/projects/0309/twitter-poster/x-post.js --whoami
+node /home/kento/projects/0309/twitter-poster/skills/twitter-poster/scripts/x-post.js --whoami
 
 # auth_token を更新（アカウント初期化）
-node /home/kento/projects/0309/twitter-poster/x-post.js --set-token
+node /home/kento/projects/0309/twitter-poster/skills/twitter-poster/scripts/x-post.js --set-token
 ```
 
 ## Workflow

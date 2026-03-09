@@ -29,55 +29,55 @@ chmod 600 ~/.twitter-export/auth_token
 ### テキスト投稿
 
 ```bash
-node x-post.js "ツイート本文"
+node skills/twitter-poster/scripts/x-post.js "ツイート本文"
 ```
 
 ### リプライ
 
 ```bash
-node x-post.js --reply https://x.com/user/status/1234567890 "返信テキスト"
+node skills/twitter-poster/scripts/x-post.js --reply https://x.com/user/status/1234567890 "返信テキスト"
 ```
 
 ### リツイート（RT）
 
 ```bash
-node x-post.js --retweet https://x.com/user/status/1234567890
+node skills/twitter-poster/scripts/x-post.js --retweet https://x.com/user/status/1234567890
 ```
 
 ### 引用リツイート（QT）
 
 ```bash
-node x-post.js --quote https://x.com/user/status/1234567890 "コメント"
+node skills/twitter-poster/scripts/x-post.js --quote https://x.com/user/status/1234567890 "コメント"
 ```
 
 ### スレッド投稿
 
 ```bash
-node x-post.js --thread "1ツ目のツイート" "2つ目のツイート" "3つ目のツイート"
+node skills/twitter-poster/scripts/x-post.js --thread "1ツ目のツイート" "2つ目のツイート" "3つ目のツイート"
 ```
 
 ### 画像付き投稿
 
 ```bash
 # 1枚
-node x-post.js --media photo.jpg "キャプション"
+node skills/twitter-poster/scripts/x-post.js --media photo.jpg "キャプション"
 
 # 複数枚（最大4枚）
-node x-post.js --media a.jpg --media b.jpg --media c.jpg "複数画像"
+node skills/twitter-poster/scripts/x-post.js --media a.jpg --media b.jpg --media c.jpg "複数画像"
 ```
 
 ### 動画付き投稿
 
 ```bash
-node x-post.js --media video.mp4 "動画のキャプション"
+node skills/twitter-poster/scripts/x-post.js --media video.mp4 "動画のキャプション"
 ```
 
 ### dry-run（実際には投稿しない）
 
 ```bash
-node x-post.js --dry-run "テスト"
-node x-post.js --dry-run --thread "1" "2" "3"
-node x-post.js --dry-run --media photo.jpg "確認"
+node skills/twitter-poster/scripts/x-post.js --dry-run "テスト"
+node skills/twitter-poster/scripts/x-post.js --dry-run --thread "1" "2" "3"
+node skills/twitter-poster/scripts/x-post.js --dry-run --media photo.jpg "確認"
 ```
 
 ---
