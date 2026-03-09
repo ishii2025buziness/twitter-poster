@@ -25,7 +25,6 @@
  *   node x-post.js --reply <tweet-url> "reply text"
  *   node x-post.js --retweet <tweet-url>
  *   node x-post.js --quote <tweet-url> "comment"
- *   node x-post.js --media <file1> [--media <file2>] "tweet text"
  *   node x-post.js --dry-run "text"
  *
  * Options:
@@ -33,7 +32,6 @@
  *   --retweet <url>    Retweet the tweet at given URL
  *   --quote <url>      Quote-tweet the tweet at given URL
  *   --thread           Post remaining positional args as a thread
- *   --media <file>     Attach media file (can be repeated, up to 4 images or 1 video)
  *   --dry-run          Parse args and print what would be sent, without posting
  *   --no-headless      Connect via CDP to existing Chrome at port 9222
  *   --port <number>    CDP port (default: 9222, --no-headless only)
@@ -99,16 +97,17 @@ function getAuthToken() {
  */
 function buildAuthCookies() {
   const authToken = getAuthToken();
+  const cookieBase = {
+    name: 'auth_token',
+    value: authToken,
+    path: '/',
+    httpOnly: true,
+    secure: true,
+    sameSite: 'None',
+  };
   const cookies = [
-    {
-      name: 'auth_token',
-      value: authToken,
-      domain: '.x.com',
-      path: '/',
-      httpOnly: true,
-      secure: true,
-      sameSite: 'None',
-    },
+    { ...cookieBase, domain: '.x.com' },
+    { ...cookieBase, domain: '.twitter.com' },
   ];
   console.log('auth_token retrieved from file');
   return cookies;
@@ -175,7 +174,6 @@ function parseArgs() {
     replyUrl: null,
     retweetUrl: null,
     quoteUrl: null,
-    mediaFiles: [],
     dryRun: false,
     headless: true,
     port: 9222,
@@ -212,9 +210,6 @@ function parseArgs() {
     } else if (arg === '--thread') {
       config.mode = 'thread';
       i++;
-    } else if (arg === '--media' && argv[i + 1]) {
-      config.mediaFiles.push(argv[i + 1]);
-      i += 2;
     } else if (!arg.startsWith('--')) {
       config.texts.push(arg);
       i++;
@@ -263,19 +258,6 @@ function parseArgs() {
     }
   }
 
-  // Validate media files exist
-  for (const f of config.mediaFiles) {
-    if (!fs.existsSync(f)) {
-      console.error(`ERROR: Media file not found: ${f}`);
-      process.exit(1);
-    }
-  }
-
-  if (config.mediaFiles.length > 4) {
-    console.error('ERROR: Maximum 4 media files per tweet');
-    process.exit(1);
-  }
-
   return config;
 }
 
@@ -287,7 +269,6 @@ Usage:
   node x-post.js --reply <tweet-url> "reply text"
   node x-post.js --retweet <tweet-url>
   node x-post.js --quote <tweet-url> "comment"
-  node x-post.js --media <file> "tweet text"
   node x-post.js --dry-run "text"
 
 Options:
@@ -295,7 +276,6 @@ Options:
   --retweet <url>    Retweet the tweet at given URL
   --quote <url>      Quote-tweet with comment
   --thread           Post remaining positional args as a thread
-  --media <file>     Attach media (repeat for multiple; max 4 images or 1 video)
   --dry-run          Show what would be posted without actually posting
   --no-headless      Connect via CDP to existing Chrome at port 9222
   --port <n>         CDP port (default: 9222)
@@ -379,196 +359,7 @@ const CREATE_TWEET_FEATURES = {
 };
 
 // ---------------------------------------------------------------------------
-// Media upload helpers
-// ---------------------------------------------------------------------------
-
-/**
- * Determine media_type and media_category from file extension.
- */
-function getMediaMeta(filePath) {
-  const ext = path.extname(filePath).toLowerCase();
-  const map = {
-    '.jpg':  { mediaType: 'image/jpeg', mediaCategory: 'tweet_image' },
-    '.jpeg': { mediaType: 'image/jpeg', mediaCategory: 'tweet_image' },
-    '.png':  { mediaType: 'image/png',  mediaCategory: 'tweet_image' },
-    '.gif':  { mediaType: 'image/gif',  mediaCategory: 'tweet_gif'   },
-    '.mp4':  { mediaType: 'video/mp4',  mediaCategory: 'tweet_video' },
-    '.mov':  { mediaType: 'video/mp4',  mediaCategory: 'tweet_video' },
-    '.webm': { mediaType: 'video/webm', mediaCategory: 'tweet_video' },
-  };
-  const meta = map[ext];
-  if (!meta) {
-    console.error(`ERROR: Unsupported media file type: ${ext}`);
-    process.exit(1);
-  }
-  return meta;
-}
-
-/**
- * Upload one media file to Twitter's chunked media upload API.
- * Runs inside page.evaluate() using FormData + fetch with credentials:include.
- * The file buffer is passed as a base64 string from Node.js, decoded in browser.
- *
- * Returns media_id_string on success.
- */
-async function uploadMediaFile(page, filePath, bearer) {
-  console.log(`  Uploading media: ${path.basename(filePath)}`);
-
-  const fileBuffer = fs.readFileSync(filePath);
-  const base64Data = fileBuffer.toString('base64');
-  const totalBytes = fileBuffer.length;
-  const { mediaType, mediaCategory } = getMediaMeta(filePath);
-  const isVideo = mediaCategory === 'tweet_video';
-
-  // Chunk size: 5MB for video, whole file for images
-  const CHUNK_SIZE = 5 * 1024 * 1024;
-
-  const mediaId = await page.evaluate(
-    async ({ base64Data, totalBytes, mediaType, mediaCategory, isVideo, chunkSize, bearer }) => {
-      // Decode base64 → Uint8Array
-      const binaryStr = atob(base64Data);
-      const bytes = new Uint8Array(binaryStr.length);
-      for (let i = 0; i < binaryStr.length; i++) {
-        bytes[i] = binaryStr.charCodeAt(i);
-      }
-
-      const uploadUrl = 'https://upload.twitter.com/1.1/media/upload.json';
-
-      // Shared auth headers (no Content-Type — FormData sets boundary)
-      function authHeaders(csrfToken) {
-        return {
-          'x-csrf-token': csrfToken,
-          'authorization': `Bearer ${bearer}`,
-          'x-twitter-auth-type': 'OAuth2Session',
-          'x-twitter-active-user': 'yes',
-        };
-      }
-
-      // Extract ct0 CSRF token from cookie
-      const ct0Entry = document.cookie.split(';').map(c => c.trim()).find(c => c.startsWith('ct0='));
-      if (!ct0Entry) throw new Error('ct0 cookie not found in page context');
-      const csrfToken = ct0Entry.split('=')[1];
-
-      // --- INIT ---
-      const initForm = new FormData();
-      initForm.append('command', 'INIT');
-      initForm.append('total_bytes', String(totalBytes));
-      initForm.append('media_type', mediaType);
-      initForm.append('media_category', mediaCategory);
-
-      const initRes = await fetch(uploadUrl, {
-        method: 'POST',
-        credentials: 'include',
-        headers: authHeaders(csrfToken),
-        body: initForm,
-      });
-      if (!initRes.ok) {
-        const txt = await initRes.text();
-        throw new Error(`INIT failed (${initRes.status}): ${txt}`);
-      }
-      const initData = await initRes.json();
-      const mediaId = initData.media_id_string;
-      if (!mediaId) throw new Error('INIT response missing media_id_string');
-
-      // --- APPEND (chunked) ---
-      const numChunks = Math.ceil(totalBytes / chunkSize);
-      for (let seg = 0; seg < numChunks; seg++) {
-        const start = seg * chunkSize;
-        const end = Math.min(start + chunkSize, totalBytes);
-        const chunk = bytes.slice(start, end);
-        const blob = new Blob([chunk], { type: mediaType });
-
-        const appendForm = new FormData();
-        appendForm.append('command', 'APPEND');
-        appendForm.append('media_id', mediaId);
-        appendForm.append('segment_index', String(seg));
-        appendForm.append('media', blob);
-
-        const appendRes = await fetch(uploadUrl, {
-          method: 'POST',
-          credentials: 'include',
-          headers: authHeaders(csrfToken),
-          body: appendForm,
-        });
-        // 204 No Content is success for APPEND
-        if (!appendRes.ok && appendRes.status !== 204) {
-          const txt = await appendRes.text();
-          throw new Error(`APPEND segment ${seg} failed (${appendRes.status}): ${txt}`);
-        }
-      }
-
-      // --- FINALIZE ---
-      const finalizeForm = new FormData();
-      finalizeForm.append('command', 'FINALIZE');
-      finalizeForm.append('media_id', mediaId);
-
-      const finalizeRes = await fetch(uploadUrl, {
-        method: 'POST',
-        credentials: 'include',
-        headers: authHeaders(csrfToken),
-        body: finalizeForm,
-      });
-      if (!finalizeRes.ok) {
-        const txt = await finalizeRes.text();
-        throw new Error(`FINALIZE failed (${finalizeRes.status}): ${txt}`);
-      }
-      const finalizeData = await finalizeRes.json();
-
-      // --- POLL for video processing ---
-      if (isVideo && finalizeData.processing_info) {
-        let state = finalizeData.processing_info.state;
-        let checkAfterSecs = finalizeData.processing_info.check_after_secs || 5;
-
-        while (state === 'pending' || state === 'in_progress') {
-          await new Promise(r => setTimeout(r, checkAfterSecs * 1000));
-
-          const statusRes = await fetch(
-            `${uploadUrl}?command=STATUS&media_id=${mediaId}`,
-            {
-              method: 'GET',
-              credentials: 'include',
-              headers: authHeaders(csrfToken),
-            }
-          );
-          if (!statusRes.ok) {
-            const txt = await statusRes.text();
-            throw new Error(`STATUS check failed (${statusRes.status}): ${txt}`);
-          }
-          const statusData = await statusRes.json();
-          const pi = statusData.processing_info;
-          if (!pi) break;
-          state = pi.state;
-          checkAfterSecs = pi.check_after_secs || 5;
-        }
-
-        if (state === 'failed') {
-          throw new Error('Video processing failed on Twitter side');
-        }
-      }
-
-      return mediaId;
-    },
-    { base64Data, totalBytes, mediaType, mediaCategory, isVideo, chunkSize: CHUNK_SIZE, bearer }
-  );
-
-  console.log(`  Media uploaded: id=${mediaId}`);
-  return mediaId;
-}
-
-/**
- * Upload all media files and return array of media_id strings.
- */
-async function uploadAllMedia(page, mediaFiles, bearer) {
-  if (mediaFiles.length === 0) return [];
-  console.log(`Uploading ${mediaFiles.length} media file(s)...`);
-  const ids = [];
-  for (const f of mediaFiles) {
-    const id = await uploadMediaFile(page, f, bearer);
-    ids.push(id);
-  }
-  console.log(`All media uploaded: [${ids.join(', ')}]`);
-  return ids;
-}
+// (Media upload removed: not supported via CDP session auth)
 
 // ---------------------------------------------------------------------------
 // GraphQL posting operations
@@ -578,9 +369,9 @@ async function uploadAllMedia(page, mediaFiles, bearer) {
  * Post a single tweet via GraphQL CreateTweet.
  * All params are passed into page.evaluate() to run inside the browser context.
  */
-async function postTweet(page, { text, queryId, replyToId, quoteUrl, mediaIds, bearer }) {
+async function postTweet(page, { text, queryId, replyToId, quoteUrl, bearer }) {
   return page.evaluate(
-    async ({ text, queryId, replyToId, quoteUrl, mediaIds, bearer, features }) => {
+    async ({ text, queryId, replyToId, quoteUrl, bearer, features }) => {
       if (location.origin !== 'https://x.com') return { error: 'wrong origin' };
 
       const ct0Entry = document.cookie.split(';').map(c => c.trim()).find(c => c.startsWith('ct0='));
@@ -590,10 +381,6 @@ async function postTweet(page, { text, queryId, replyToId, quoteUrl, mediaIds, b
       const variables = {
         tweet_text: text,
         dark_request: false,
-        media: {
-          media_ids: mediaIds || [],
-          tagged_user_ids: [],
-        },
         semantic_annotation_ids: [],
         reply_control: {},
       };
@@ -629,7 +416,7 @@ async function postTweet(page, { text, queryId, replyToId, quoteUrl, mediaIds, b
         return { error: e.message };
       }
     },
-    { text, queryId, replyToId, quoteUrl, mediaIds, bearer, features: CREATE_TWEET_FEATURES }
+    { text, queryId, replyToId, quoteUrl, bearer, features: CREATE_TWEET_FEATURES }
   );
 }
 
@@ -663,7 +450,9 @@ async function postRetweet(page, { tweetId, queryId, bearer }) {
           },
           body: JSON.stringify({ variables, features: {}, queryId }),
         });
-        const data = await res.json();
+        const text = await res.text();
+        let data = {};
+        try { data = text ? JSON.parse(text) : {}; } catch {}
         if (!res.ok) return { error: `HTTP ${res.status}`, data };
         return { ok: true, data };
       } catch (e) {
@@ -679,7 +468,7 @@ async function postRetweet(page, { tweetId, queryId, bearer }) {
  */
 function extractPostedTweetId(result) {
   try {
-    const tweet = result.data?.create_tweet?.tweet_results?.result;
+    const tweet = result?.data?.create_tweet?.tweet_results?.result;
     return tweet?.rest_id || null;
   } catch {
     return null;
@@ -690,13 +479,11 @@ function extractPostedTweetId(result) {
 // High-level operation dispatchers
 // ---------------------------------------------------------------------------
 
-async function runThread(page, texts, queryIds, mediaIds, bearer) {
-  // Only first tweet in thread gets media; subsequent tweets are plain text replies
+async function runThread(page, texts, queryIds, bearer) {
   let prevTweetId = null;
 
   for (let i = 0; i < texts.length; i++) {
     const text = texts[i];
-    const attachMedia = i === 0 ? mediaIds : [];
 
     console.log(`Posting thread tweet ${i + 1}/${texts.length}: "${text.slice(0, 60)}${text.length > 60 ? '...' : ''}"`);
 
@@ -705,7 +492,6 @@ async function runThread(page, texts, queryIds, mediaIds, bearer) {
       queryId: queryIds.CreateTweet,
       replyToId: prevTweetId,
       quoteUrl: null,
-      mediaIds: attachMedia,
       bearer,
     });
 
@@ -752,8 +538,6 @@ async function main() {
   if (config.replyUrl) console.log('Reply to:', config.replyUrl);
   if (config.retweetUrl) console.log('Retweet:', config.retweetUrl);
   if (config.quoteUrl) console.log('Quote tweet:', config.quoteUrl);
-  if (config.mediaFiles.length) console.log('Media files:', config.mediaFiles);
-
   let browser;
   let headlessBrowser;
   let page;
@@ -830,8 +614,6 @@ async function main() {
     }
 
     // --- Upload media if any ---
-    const mediaIds = await uploadAllMedia(page, config.mediaFiles, BEARER_TOKEN);
-
     // --- Execute the requested operation ---
     let result;
 
@@ -844,7 +626,6 @@ async function main() {
           queryId: queryIds.CreateTweet,
           replyToId: null,
           quoteUrl: null,
-          mediaIds,
           bearer: BEARER_TOKEN,
         });
         if (result.error) {
@@ -866,7 +647,6 @@ async function main() {
           queryId: queryIds.CreateTweet,
           replyToId,
           quoteUrl: null,
-          mediaIds,
           bearer: BEARER_TOKEN,
         });
         if (result.error) {
@@ -906,7 +686,6 @@ async function main() {
           queryId: queryIds.CreateTweet,
           replyToId: null,
           quoteUrl: quoteAttachUrl,
-          mediaIds,
           bearer: BEARER_TOKEN,
         });
         if (result.error) {
@@ -921,7 +700,7 @@ async function main() {
 
       case 'thread': {
         console.log(`Posting thread of ${config.texts.length} tweets`);
-        await runThread(page, config.texts, queryIds, mediaIds, BEARER_TOKEN);
+        await runThread(page, config.texts, queryIds, BEARER_TOKEN);
         console.log('Thread posted successfully');
         break;
       }
@@ -952,4 +731,4 @@ if (require.main === module) {
   });
 }
 
-module.exports = { main, extractTweetId, getMediaMeta };
+module.exports = { main, extractTweetId };
