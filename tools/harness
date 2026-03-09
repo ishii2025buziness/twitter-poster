@@ -1,0 +1,418 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+TEMPLATE_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+TEMPLATE_MARKER=".agent-harness-template-root"
+
+usage() {
+  cat <<'EOF'
+Usage:
+  harness check <target-repo>
+  harness self-check
+EOF
+}
+
+require_path() {
+  local target="$1"
+  if [[ ! -d "$target" ]]; then
+    echo "[harness] target is not a directory: $target" >&2
+    exit 1
+  fi
+}
+
+# Placeholder text that ships with the template.
+# If this exact string is present, the file is considered unfilled.
+PROGRESS_PLACEHOLDER="Replace this placeholder with the next concrete steps."
+
+OBJECTIVE_HEADERS='^## (Objective|Goal|Current Goal)$'
+NEXT_HEADERS='^## (Next Actions|Next|Do Next)$'
+KEY_PATHS_HEADERS='^## (Key Paths|Important Paths|Relevant Paths)$'
+RESUME_HEADERS='^## (Resume Here|Resume Notes|Handoff)$'
+
+section_lines() {
+  local file="$1"
+  local header_regex="$2"
+
+  awk -v header_regex="$header_regex" '
+    $0 ~ header_regex {
+      in_section=1
+      next
+    }
+    /^## / && in_section {
+      exit
+    }
+    in_section {
+      print
+    }
+  ' "$file"
+}
+
+strip_wrapping() {
+  local value="$1"
+  value="${value#\`}"
+  value="${value%\`}"
+  value="${value#\"}"
+  value="${value%\"}"
+  printf '%s' "$value"
+}
+
+validate_key_paths_section() {
+  local target="$1"
+  local progress_file="$2"
+  local failed=0
+  local section
+  local bullets
+
+  section="$(section_lines "$progress_file" "$KEY_PATHS_HEADERS")"
+  bullets="$(printf '%s\n' "$section" | grep '^- ' || true)"
+
+  if [[ -z "$bullets" ]]; then
+    echo "  invalid: progress/current.md is missing usable Key Paths bullets"
+    return 1
+  fi
+
+  while IFS= read -r line; do
+    [[ -z "$line" ]] && continue
+
+    if [[ "$line" != *:* ]]; then
+      echo "  invalid: Key Paths bullet must use 'label: path' format"
+      failed=1
+      continue
+    fi
+
+    local path_value
+    path_value="${line#*: }"
+    path_value="$(strip_wrapping "$path_value")"
+
+    case "$path_value" in
+      "N/A"|"n/a"|"None"|"none"|"TBD"|"Pending")
+        continue
+        ;;
+    esac
+
+    if [[ "$path_value" = /* ]]; then
+      if [[ ! -e "$path_value" ]]; then
+        echo "  invalid: Key Paths entry does not exist: $path_value"
+        failed=1
+      fi
+    else
+      if [[ ! -e "$target/$path_value" ]]; then
+        echo "  invalid: Key Paths entry does not exist: $path_value"
+        failed=1
+      fi
+    fi
+  done <<< "$bullets"
+
+  return "$failed"
+}
+
+validate_resume_section() {
+  local target="$1"
+  local progress_file="$2"
+  local failed=0
+  local section
+  local bullets
+
+  section="$(section_lines "$progress_file" "$RESUME_HEADERS")"
+  bullets="$(printf '%s\n' "$section" | grep '^- ' || true)"
+
+  if [[ -z "$bullets" ]]; then
+    echo "  invalid: progress/current.md is missing Resume Here bullets"
+    return 1
+  fi
+
+  while IFS= read -r line; do
+    [[ -z "$line" ]] && continue
+
+    if [[ ! "$line" =~ ^-\ [^:]+:\ .+ ]]; then
+      echo "  invalid: Resume Here bullets must include concrete values"
+      failed=1
+      continue
+    fi
+
+    if [[ "$line" =~ ^-\ Next\ file\ to\ open:\ (.+)$ ]]; then
+      local file_value
+      file_value="${BASH_REMATCH[1]}"
+      file_value="$(strip_wrapping "$file_value")"
+      case "$file_value" in
+        "N/A"|"n/a"|"None"|"none")
+          ;;
+        /*)
+          if [[ ! -e "$file_value" ]]; then
+            echo "  invalid: Resume Here file does not exist: $file_value"
+            failed=1
+          fi
+          ;;
+        *)
+          if [[ ! -e "$target/$file_value" ]]; then
+            echo "  invalid: Resume Here file does not exist: $file_value"
+            failed=1
+          fi
+          ;;
+      esac
+    fi
+  done <<< "$bullets"
+
+  return "$failed"
+}
+
+require_filled_line() {
+  local file="$1"
+  local pattern="$2"
+  local message="$3"
+
+  if ! grep -Eq "$pattern" "$file"; then
+    echo "  invalid: $message"
+    return 1
+  fi
+
+  return 0
+}
+
+check_common() {
+  local target="$1"
+  local failed=0
+  local warned=0
+
+  # --- Skeleton existence ---
+
+  if [[ ! -f "$target/AGENTS.md" ]]; then
+    echo "  missing: AGENTS.md"
+    failed=1
+  fi
+
+  if [[ ! -d "$target/docs" ]]; then
+    echo "  missing: docs/"
+    failed=1
+  fi
+
+  if [[ ! -f "$target/docs/README.md" ]]; then
+    echo "  missing: docs/README.md"
+    failed=1
+  fi
+
+  if [[ ! -d "$target/progress" ]]; then
+    echo "  missing: progress/"
+    failed=1
+  fi
+
+  if [[ ! -f "$target/progress/current.md" ]]; then
+    echo "  missing: progress/current.md"
+    failed=1
+  fi
+
+  # --- AGENTS.md required sections ---
+
+  if [[ -f "$target/AGENTS.md" ]]; then
+    if ! grep -q '^## Working Rules' "$target/AGENTS.md"; then
+      echo "  invalid: AGENTS.md is missing '## Working Rules'"
+      failed=1
+    fi
+    if ! grep -q '^## Definition of Done' "$target/AGENTS.md"; then
+      echo "  invalid: AGENTS.md is missing '## Definition of Done'"
+      failed=1
+    fi
+    if ! grep -q '^## Working Loop' "$target/AGENTS.md"; then
+      echo "  warn: AGENTS.md is missing '## Working Loop'"
+      warned=1
+    fi
+    if ! grep -q '^## Blockers' "$target/AGENTS.md"; then
+      echo "  warn: AGENTS.md is missing '## Blockers' definition"
+      warned=1
+    fi
+  fi
+
+  # --- Checker presence & executability in target ---
+
+  if [[ ! -f "$target/tools/harness" ]]; then
+    echo "  missing: tools/harness"
+    failed=1
+  elif [[ ! -x "$target/tools/harness" ]]; then
+    echo "  invalid: tools/harness is not executable"
+    failed=1
+  fi
+
+  # --- progress/current.md content validity (only if not placeholder) ---
+
+  if [[ -f "$target/progress/current.md" ]]; then
+    if ! grep -q "$PROGRESS_PLACEHOLDER" "$target/progress/current.md"; then
+      # File has been edited beyond the template placeholder — check structure.
+      if ! grep -Eq "$OBJECTIVE_HEADERS" "$target/progress/current.md"; then
+        echo "  invalid: progress/current.md has content but no Objective/Goal section"
+        failed=1
+      fi
+      if ! grep -Eq "$NEXT_HEADERS" "$target/progress/current.md"; then
+        echo "  invalid: progress/current.md has content but no Next Actions section"
+        failed=1
+      fi
+      if ! grep -Eq "$KEY_PATHS_HEADERS" "$target/progress/current.md"; then
+        echo "  invalid: progress/current.md has content but no Key Paths section"
+        failed=1
+      else
+        if ! validate_key_paths_section "$target" "$target/progress/current.md"; then
+          failed=1
+        fi
+      fi
+      if ! grep -Eq "$RESUME_HEADERS" "$target/progress/current.md"; then
+        echo "  invalid: progress/current.md has content but no Resume Here section"
+        failed=1
+      else
+        if ! validate_resume_section "$target" "$target/progress/current.md"; then
+          failed=1
+        fi
+      fi
+      if ! grep -q '^## Blockers' "$target/progress/current.md"; then
+        echo "  invalid: progress/current.md has content but no Blockers section"
+        failed=1
+      fi
+
+      if ! require_filled_line "$target/progress/current.md" '^- What was changed:\ .+' "Last Session 'What was changed' is empty"; then
+        failed=1
+      fi
+      if ! require_filled_line "$target/progress/current.md" '^- What was verified:\ .+' "Last Session 'What was verified' is empty"; then
+        failed=1
+      fi
+      if ! require_filled_line "$target/progress/current.md" '^- Where to resume:\ .+' "Last Session 'Where to resume' is empty"; then
+        failed=1
+      fi
+      if ! require_filled_line "$target/progress/current.md" '^- Command:\ .+' "Last Verified command is empty"; then
+        failed=1
+      fi
+      if ! require_filled_line "$target/progress/current.md" '^- Result:\ .+' "Last Verified result is empty"; then
+        failed=1
+      fi
+      if ! require_filled_line "$target/progress/current.md" '^- Date:\ .+' "Last Verified date is empty"; then
+        failed=1
+      fi
+    fi
+
+    # Warn if blockers exist and are not "None"
+    if grep -q '^## Blockers' "$target/progress/current.md"; then
+      local blockers_content
+      blockers_content="$(sed -n '/^## Blockers/,/^## /{ /^## /d; p; }' "$target/progress/current.md" | grep '^- ' | grep -v '^- None\.' || true)"
+      if [[ -n "$blockers_content" ]]; then
+        echo "  notice: active blockers found — ensure the user has been notified"
+        warned=1
+      fi
+    fi
+  fi
+
+  echo "$failed:$warned"
+}
+
+check_repo() {
+  local target="$1"
+
+  require_path "$target"
+
+  echo "[harness] checking template compliance: $target"
+
+  local result
+  result="$(check_common "$target")"
+
+  # Parse the last line (failed:warned) from output that may include echo'd messages
+  local messages
+  messages="$(echo "$result" | head -n -1)"
+  local counts
+  counts="$(echo "$result" | tail -1)"
+  local failed="${counts%%:*}"
+  local warned="${counts##*:}"
+
+  if [[ -n "$messages" ]]; then
+    echo "$messages"
+  fi
+
+  if [[ "$failed" -ne 0 ]]; then
+    echo "[harness] check failed"
+    exit 1
+  fi
+
+  if [[ "$warned" -ne 0 ]]; then
+    echo "[harness] check passed with warnings"
+  else
+    echo "[harness] check passed"
+  fi
+}
+
+self_check() {
+  local target="$TEMPLATE_ROOT"
+  local mode="shared"
+
+  require_path "$target"
+
+  if [[ -f "$target/$TEMPLATE_MARKER" ]]; then
+    mode="template-strict"
+  fi
+
+  echo "[harness] self-check ($mode): $target"
+
+  local result
+  result="$(check_common "$target")"
+
+  local messages
+  messages="$(echo "$result" | head -n -1)"
+  local counts
+  counts="$(echo "$result" | tail -1)"
+  local failed="${counts%%:*}"
+  local warned="${counts##*:}"
+
+  if [[ -n "$messages" ]]; then
+    echo "$messages"
+  fi
+
+  if [[ "$mode" == "template-strict" ]]; then
+    # Template-specific: skills/harness/SKILL.md must exist
+    if [[ ! -f "$target/skills/harness/SKILL.md" ]]; then
+      echo "  missing: skills/harness/SKILL.md (template-only)"
+      failed=$((failed + 1))
+    fi
+
+    # Template-specific: verify wrapper must exist and be executable
+    if [[ ! -f "$target/verify" ]]; then
+      echo "  missing: verify (template-only)"
+      failed=$((failed + 1))
+    elif [[ ! -x "$target/verify" ]]; then
+      echo "  invalid: verify is not executable (template-only)"
+      failed=$((failed + 1))
+    fi
+  fi
+
+  if [[ "$failed" -ne 0 ]]; then
+    echo "[harness] self-check failed"
+    exit 1
+  fi
+
+  if [[ "$warned" -ne 0 ]]; then
+    echo "[harness] self-check passed with warnings"
+  else
+    echo "[harness] self-check passed"
+  fi
+}
+
+main() {
+  local command="${1:-}"
+
+  case "$command" in
+    check)
+      if [[ $# -ne 2 ]]; then
+        usage
+        exit 1
+      fi
+      check_repo "$2"
+      ;;
+    self-check)
+      if [[ $# -ne 1 ]]; then
+        usage
+        exit 1
+      fi
+      self_check
+      ;;
+    *)
+      usage
+      exit 1
+      ;;
+  esac
+}
+
+main "$@"
