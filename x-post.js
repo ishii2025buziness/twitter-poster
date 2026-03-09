@@ -145,8 +145,8 @@ async function verifyCt0(page) {
 }
 
 /**
- * Fetch the screen_name of the currently logged-in account via internal API.
- * Returns "@username" or null on failure.
+ * Fetch the screen_name of the currently logged-in account via Viewer GraphQL query.
+ * Returns "username" or null on failure.
  */
 async function getLoggedInUser(page) {
   return page.evaluate(async (bearer) => {
@@ -154,7 +154,29 @@ async function getLoggedInUser(page) {
     if (!ct0Entry) return null;
     const csrfToken = ct0Entry.split('=')[1];
     try {
-      const res = await fetch('https://x.com/i/api/1.1/account/settings.json', {
+      // Extract Viewer queryId from JS bundles
+      const scripts = [...document.querySelectorAll('script[src]')]
+        .map(s => s.src)
+        .filter(s => s.includes('client-web'));
+      let viewerQid = null;
+      for (const url of scripts) {
+        try {
+          const text = await fetch(url).then(r => r.text());
+          const m = text.match(/queryId:"([^"]+)",operationName:"Viewer"/);
+          if (m) { viewerQid = m[1]; break; }
+        } catch {}
+      }
+      if (!viewerQid) return null;
+
+      const features = {
+        responsive_web_graphql_exclude_directive_enabled: true,
+        verified_phone_label_enabled: false,
+        responsive_web_graphql_skip_user_profile_image_extensions_enabled: false,
+        responsive_web_graphql_timeline_navigation_enabled: true,
+      };
+      const variables = { withCommunitiesMemberships: true };
+      const apiUrl = `https://x.com/i/api/graphql/${viewerQid}/Viewer?variables=${encodeURIComponent(JSON.stringify(variables))}&features=${encodeURIComponent(JSON.stringify(features))}`;
+      const res = await fetch(apiUrl, {
         credentials: 'include',
         headers: {
           'authorization': `Bearer ${bearer}`,
@@ -165,7 +187,8 @@ async function getLoggedInUser(page) {
       });
       if (!res.ok) return null;
       const data = await res.json();
-      return data.screen_name || null;
+      const m = JSON.stringify(data).match(/"screen_name":"([^"]+)"/);
+      return m ? m[1] : null;
     } catch {
       return null;
     }
