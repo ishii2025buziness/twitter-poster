@@ -174,6 +174,7 @@ function parseArgs() {
     replyUrl: null,
     retweetUrl: null,
     quoteUrl: null,
+    mediaFiles: [],
     dryRun: false,
     headless: true,
     port: 9222,
@@ -210,6 +211,9 @@ function parseArgs() {
     } else if (arg === '--thread') {
       config.mode = 'thread';
       i++;
+    } else if (arg === '--media' && argv[i + 1]) {
+      config.mediaFiles.push(argv[i + 1]);
+      i += 2;
     } else if (!arg.startsWith('--')) {
       config.texts.push(arg);
       i++;
@@ -359,7 +363,100 @@ const CREATE_TWEET_FEATURES = {
 };
 
 // ---------------------------------------------------------------------------
-// (Media upload removed: not supported via CDP session auth)
+// Media upload via page.evaluate() (browser context, upload.x.com)
+// ---------------------------------------------------------------------------
+
+async function uploadMediaFile(page, filePath) {
+  console.log(`  Uploading media: ${path.basename(filePath)}`);
+
+  const fileBuffer = fs.readFileSync(filePath);
+  const totalBytes = fileBuffer.length;
+  const ext = path.extname(filePath).toLowerCase();
+  const typeMap = {
+    '.jpg': ['image/jpeg', 'tweet_image'], '.jpeg': ['image/jpeg', 'tweet_image'],
+    '.png': ['image/png', 'tweet_image'],  '.gif': ['image/gif', 'tweet_gif'],
+    '.mp4': ['video/mp4', 'tweet_video'],  '.mov': ['video/mp4', 'tweet_video'],
+    '.webm': ['video/webm', 'tweet_video'],
+  };
+  const [mediaType, mediaCategory] = typeMap[ext] || (() => { throw new Error(`Unsupported file type: ${ext}`); })();
+  const isVideo = mediaCategory === 'tweet_video';
+  const CHUNK_SIZE = 5 * 1024 * 1024;
+  const base64Data = fileBuffer.toString('base64');
+
+  const mediaId = await page.evaluate(
+    async ({ base64Data, totalBytes, mediaType, mediaCategory, isVideo, chunkSize, bearer }) => {
+      const uploadUrl = 'https://upload.x.com/1.1/media/upload.json';
+
+      const ct0Entry = document.cookie.split(';').map(c => c.trim()).find(c => c.startsWith('ct0='));
+      if (!ct0Entry) throw new Error('ct0 cookie not found');
+      const csrfToken = ct0Entry.split('=')[1];
+
+      const headers = {
+        'x-csrf-token': csrfToken,
+        'authorization': `Bearer ${bearer}`,
+        'x-twitter-auth-type': 'OAuth2Session',
+        'x-twitter-active-user': 'yes',
+      };
+
+      // Decode base64 → Uint8Array
+      const binaryStr = atob(base64Data);
+      const bytes = new Uint8Array(binaryStr.length);
+      for (let i = 0; i < binaryStr.length; i++) bytes[i] = binaryStr.charCodeAt(i);
+
+      // INIT
+      const initForm = new FormData();
+      initForm.append('command', 'INIT');
+      initForm.append('total_bytes', String(totalBytes));
+      initForm.append('media_type', mediaType);
+      initForm.append('media_category', mediaCategory);
+      const initRes = await fetch(uploadUrl, { method: 'POST', credentials: 'include', headers, body: initForm });
+      if (!initRes.ok) { const t = await initRes.text(); throw new Error(`INIT ${initRes.status}: ${t}`); }
+      const { media_id_string: mediaId } = await initRes.json();
+      if (!mediaId) throw new Error('INIT: no media_id_string');
+
+      // APPEND
+      const numChunks = Math.ceil(totalBytes / chunkSize);
+      for (let seg = 0; seg < numChunks; seg++) {
+        const chunk = bytes.slice(seg * chunkSize, Math.min((seg + 1) * chunkSize, totalBytes));
+        const appendForm = new FormData();
+        appendForm.append('command', 'APPEND');
+        appendForm.append('media_id', mediaId);
+        appendForm.append('segment_index', String(seg));
+        appendForm.append('media', new Blob([chunk], { type: mediaType }));
+        const r = await fetch(uploadUrl, { method: 'POST', credentials: 'include', headers, body: appendForm });
+        if (!r.ok && r.status !== 204) { const t = await r.text(); throw new Error(`APPEND[${seg}] ${r.status}: ${t}`); }
+      }
+
+      // FINALIZE
+      const finalizeForm = new FormData();
+      finalizeForm.append('command', 'FINALIZE');
+      finalizeForm.append('media_id', mediaId);
+      const finalizeRes = await fetch(uploadUrl, { method: 'POST', credentials: 'include', headers, body: finalizeForm });
+      if (!finalizeRes.ok) { const t = await finalizeRes.text(); throw new Error(`FINALIZE ${finalizeRes.status}: ${t}`); }
+      const finalizeData = await finalizeRes.json();
+
+      // POLL for video
+      if (isVideo && finalizeData.processing_info) {
+        let { state, check_after_secs: wait = 5 } = finalizeData.processing_info;
+        while (state === 'pending' || state === 'in_progress') {
+          await new Promise(r => setTimeout(r, wait * 1000));
+          const sr = await fetch(`${uploadUrl}?command=STATUS&media_id=${mediaId}`, { credentials: 'include', headers });
+          if (!sr.ok) { const t = await sr.text(); throw new Error(`STATUS ${sr.status}: ${t}`); }
+          const sd = await sr.json();
+          if (!sd.processing_info) break;
+          ({ state, check_after_secs: wait = 5 } = sd.processing_info);
+        }
+        if (state === 'failed') throw new Error('Video processing failed');
+      }
+
+      return mediaId;
+    },
+    { base64Data, totalBytes, mediaType, mediaCategory, isVideo, chunkSize: CHUNK_SIZE, bearer: BEARER_TOKEN }
+  );
+
+  console.log(`  Media uploaded: id=${mediaId}`);
+  return mediaId;
+}
 
 // ---------------------------------------------------------------------------
 // GraphQL posting operations
@@ -369,9 +466,9 @@ const CREATE_TWEET_FEATURES = {
  * Post a single tweet via GraphQL CreateTweet.
  * All params are passed into page.evaluate() to run inside the browser context.
  */
-async function postTweet(page, { text, queryId, replyToId, quoteUrl, bearer }) {
+async function postTweet(page, { text, queryId, replyToId, quoteUrl, mediaIds, bearer }) {
   return page.evaluate(
-    async ({ text, queryId, replyToId, quoteUrl, bearer, features }) => {
+    async ({ text, queryId, replyToId, quoteUrl, mediaIds, bearer, features }) => {
       if (location.origin !== 'https://x.com') return { error: 'wrong origin' };
 
       const ct0Entry = document.cookie.split(';').map(c => c.trim()).find(c => c.startsWith('ct0='));
@@ -382,8 +479,11 @@ async function postTweet(page, { text, queryId, replyToId, quoteUrl, bearer }) {
         tweet_text: text,
         dark_request: false,
         semantic_annotation_ids: [],
-        reply_control: {},
       };
+
+      if (mediaIds && mediaIds.length > 0) {
+        variables.media = { media_ids: mediaIds, tagged_user_ids: [] };
+      }
 
       if (replyToId) {
         variables.reply = {
@@ -416,7 +516,7 @@ async function postTweet(page, { text, queryId, replyToId, quoteUrl, bearer }) {
         return { error: e.message };
       }
     },
-    { text, queryId, replyToId, quoteUrl, bearer, features: CREATE_TWEET_FEATURES }
+    { text, queryId, replyToId, quoteUrl, mediaIds, bearer, features: CREATE_TWEET_FEATURES }
   );
 }
 
@@ -614,6 +714,14 @@ async function main() {
     }
 
     // --- Upload media if any ---
+    const mediaIds = [];
+    if (config.mediaFiles.length > 0) {
+      console.log(`Uploading ${config.mediaFiles.length} media file(s)...`);
+      for (const f of config.mediaFiles) {
+        mediaIds.push(await uploadMediaFile(page, f));
+      }
+    }
+
     // --- Execute the requested operation ---
     let result;
 
@@ -626,6 +734,7 @@ async function main() {
           queryId: queryIds.CreateTweet,
           replyToId: null,
           quoteUrl: null,
+          mediaIds,
           bearer: BEARER_TOKEN,
         });
         if (result.error) {
@@ -647,6 +756,7 @@ async function main() {
           queryId: queryIds.CreateTweet,
           replyToId,
           quoteUrl: null,
+          mediaIds,
           bearer: BEARER_TOKEN,
         });
         if (result.error) {
@@ -686,6 +796,7 @@ async function main() {
           queryId: queryIds.CreateTweet,
           replyToId: null,
           quoteUrl: quoteAttachUrl,
+          mediaIds,
           bearer: BEARER_TOKEN,
         });
         if (result.error) {

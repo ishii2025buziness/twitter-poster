@@ -6,36 +6,59 @@ Build a Twitter/X posting automation CLI (`x-post.js`) using CDP + Playwright br
 
 ## Status
 
-Core implementation complete. KEN-23/24/25/22 done. KEN-21 (pipeline integration) remains.
+テキスト・リプライ・スレッド・引用RT・RT は動作確認済み。画像アップロードは upload.x.com への INIT/APPEND/FINALIZE まで成功しているが、CreateTweet への media_ids 渡しで GRAPHQL_VALIDATION_FAILED が出ており未解決。
 
 ## Key Paths
 
 - Main implementation: x-post.js
 - Implementation plan: docs/PLAN.md
 - Harness checker: tools/harness
-- Agents instructions: AGENTS.md
+- Test image: /tmp/test.png (Python で生成した青い四角形)
 
 ## Last Session
 
-- What was changed: Implemented x-post.js (955 lines) covering KEN-23 (auth/CDP foundation), KEN-24 (text/reply/RT), KEN-25 (thread), KEN-22 (media upload). Added docs/PLAN.md with full task breakdown.
-- What was verified: node --check x-post.js passed. ./tools/harness self-check passed.
-- Where to resume: Implement KEN-21 — hook x-post.js into auto-matome pipeline (run_pipeline.sh).
+- What was changed: メディアアップロード機能を復活。upload.x.com（正しいドメイン）+ page.evaluate() 内で fetch/credentials:include を使い INIT/APPEND/FINALIZE を実行 → media_id 取得成功。CreateTweet の media variables 構造を試行錯誤中。
+- What was verified: テキスト/リプライ/スレッド/引用RT/RT は全て動作確認済み。メディアアップロード (INIT→APPEND→FINALIZE) 自体は成功し media_id が返る。
+- Where to resume: CreateTweet に media_ids を渡す正しい variables 構造を特定する。
 
 ## Resume Here
 
-- Next command to run: ./tools/harness self-check
-- Next file to open: docs/PLAN.md
-- Expected first small task: Find auto-matome repo, understand run_pipeline.sh output format, wire x-post.js call at end.
+- Next command to run: node x-post.js --media /tmp/test.png "テスト" 2>&1
+- Next file to open: x-post.js (postTweet 関数 ~line 478)
+- Expected first small task: media variables の正しい構造を特定して投稿成功させる
+
+## 画像投稿デバッグ状況
+
+### 現在のコード（x-post.js ~line 485）
+```js
+variables.media = { media_ids: mediaIds, tagged_user_ids: [] };
+```
+
+### 試した組み合わせと結果
+| media object | エラーパス |
+|---|---|
+| `{ media_ids, tagged_user_ids: [], reply_control: {} }` | `variable.media.media_ids` |
+| `{ media_ids, tagged_user_ids: [], possibly_sensitive: false }` | `variable.media.tagged_user_ids` |
+| `{ media_ids, possibly_sensitive: false }` | `variable.media.media_ids` |
+| `{ media_ids, tagged_user_ids: [] }` | TypeError: Failed to fetch |
+
+### 調査ポイント
+- `tagged_user_ids: [], possibly_sensitive: false` の組み合わせが一番エラーが先に進んだ（`tagged_user_ids` まで通過）
+- `Failed to fetch` はネットワークエラー → upload.x.com への APPEND リクエスト失敗の可能性
+- 次の試み: twitter-monitor や network intercept で実際のブラウザが送る variables を確認する
+
+### 参考: upload.x.com エンドポイント（バックグラウンドエージェント調査結果）
+- INIT/FINALIZE: `https://upload.x.com/1.1/media/upload.json`
+- APPEND: `https://upload.x.com/1.1/media/upload.json?command=APPEND&media_id=...`
 
 ## Next Actions
 
-- [ ] KEN-21: auto-matomeパイプラインへの組み込み
-  1. 場所確認: auto-matome リポジトリの `run_pipeline.sh` を探す
-  2. 記事タイトル・URL・サムネパスの受け渡し方を把握
-  3. `node x-post.js --media <thumb> "<title> <url>"` 形式で呼び出すラッパー作成
-  4. スレッド形式（トップ3記事）は `--thread` フラグで実装
-- [ ] 実機テスト: `node x-post.js "test"` で実際に投稿確認（auth_token要）
-- [ ] `--dry-run` での全オプション動作確認
+- [ ] 画像投稿の CreateTweet variables 構造を修正して動作確認
+  - 方法1: twitter-monitor でブラウザの実際のリクエストをキャプチャして variables を比較
+  - 方法2: `tagged_user_ids: [], possibly_sensitive: false` + `semantic_annotation_ids: []` の組み合わせ
+  - 方法3: page.evaluate 内でエラーをより詳しく捕捉してデバッグ
+- [ ] KEN-21: auto-matomeパイプラインへの組み込み（画像投稿完成後）
+- [ ] skill/README のメディア対応状況を更新
 
 ## Blockers
 
@@ -43,12 +66,11 @@ Core implementation complete. KEN-23/24/25/22 done. KEN-21 (pipeline integration
 
 ## Risks
 
-- Twitter 内部 GraphQL の queryId は随時変更される可能性あり（動的抽出で対応済み）
-- auth_token の有効期限は約1年。失効時は `~/.twitter-export/auth_token` を更新する必要がある
-- メディアアップロード API の仕様変更リスク
+- Twitter 内部 GraphQL の variables 構造は随時変更される可能性あり
+- media_ids の型（string vs Long）が問題の可能性
 
 ## Last Verified
 
-- Command: node --check x-post.js && ./tools/harness self-check
-- Result: Both passed.
+- Command: node x-post.js "テスト" / --reply / --thread / --quote / --retweet
+- Result: 全て成功。メディアアップロード (INIT/APPEND/FINALIZE) 単体も成功。CreateTweet+media のみ未解決。
 - Date: 2026-03-09
