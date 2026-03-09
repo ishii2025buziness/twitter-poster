@@ -554,6 +554,101 @@ async function uploadMediaFile(page, filePath) {
 }
 
 // ---------------------------------------------------------------------------
+// UI-based media posting (baoyu approach: setInputFiles + button click)
+// ---------------------------------------------------------------------------
+
+/**
+ * Post tweet/reply/quote with media via browser UI.
+ * Navigates to compose page, sets file input, types text, clicks submit.
+ * Bypasses the GRAPHQL_VALIDATION_FAILED issue with media_ids.
+ */
+async function postWithMediaUI(page, config) {
+  const { mode, texts, mediaFiles, replyUrl, quoteUrl } = config;
+  const text = texts[0] || '';
+
+  // Determine compose URL based on mode
+  let composeUrl = 'https://x.com/compose/post';
+  if (mode === 'reply') {
+    const replyId = extractTweetId(replyUrl);
+    composeUrl = `https://x.com/intent/tweet?in_reply_to=${replyId}`;
+  } else if (mode === 'quote') {
+    const quotedId = extractTweetId(quoteUrl);
+    composeUrl = `https://x.com/intent/tweet?url=https://twitter.com/i/web/status/${quotedId}`;
+  }
+
+  console.log(`Navigating to compose: ${composeUrl}`);
+  try {
+    await page.goto(composeUrl, { waitUntil: 'networkidle', timeout: 30000 });
+  } catch {
+    console.log('Page loaded (networkidle timeout normal)');
+  }
+  await page.waitForTimeout(2000);
+
+  // Wait for tweet editor
+  try {
+    await page.waitForSelector('[data-testid="tweetTextarea_0"]', { timeout: 15000 });
+    console.log('  Editor ready');
+  } catch {
+    throw new Error('Tweet editor not found. auth_token may be expired.');
+  }
+
+  // Upload media FIRST (before typing text - prevents text clear on some X versions)
+  for (let i = 0; i < mediaFiles.length; i++) {
+    const filePath = mediaFiles[i];
+    console.log(`  Setting media file (${i + 1}/${mediaFiles.length}): ${path.basename(filePath)}`);
+    try {
+      await page.setInputFiles('[data-testid="fileInput"]', filePath);
+    } catch {
+      await page.setInputFiles('input[type="file"]', filePath);
+    }
+    if (i < mediaFiles.length - 1) await page.waitForTimeout(1000);
+  }
+  await page.waitForTimeout(2000);
+
+  // Type text
+  if (text) {
+    console.log('  Typing text...');
+    await page.evaluate((t) => {
+      const editor = document.querySelector('[data-testid="tweetTextarea_0"]');
+      if (editor) { editor.focus(); document.execCommand('insertText', false, t); }
+    }, text);
+    await page.waitForTimeout(500);
+  }
+
+  // Wait for tweet button to be enabled (upload complete indicator)
+  console.log('  Waiting for upload to complete...');
+  try {
+    await page.waitForFunction(() => {
+      const btn = document.querySelector('[data-testid="tweetButton"]');
+      return btn && btn.getAttribute('aria-disabled') !== 'true' && !btn.hasAttribute('disabled');
+    }, { timeout: 120000 });
+    console.log('  Upload complete, button enabled');
+  } catch {
+    console.warn('  Warning: Could not confirm button enabled, attempting to post anyway...');
+  }
+
+  // Intercept CreateTweet response to capture tweet ID
+  let tweetId = null;
+  const captureId = async (res) => {
+    if (res.url().includes('CreateTweet')) {
+      try {
+        const m = JSON.stringify(await res.json()).match(/"rest_id":"(\d{15,})"/);
+        if (m) tweetId = m[1];
+      } catch {}
+    }
+  };
+  page.on('response', captureId);
+
+  // Click submit button
+  console.log('  Submitting...');
+  await page.click('[data-testid="tweetButton"]');
+  await page.waitForTimeout(3000);
+  page.off('response', captureId);
+
+  return tweetId;
+}
+
+// ---------------------------------------------------------------------------
 // GraphQL posting operations
 // ---------------------------------------------------------------------------
 
@@ -811,6 +906,14 @@ async function main() {
       return;
     }
 
+    // --- Media UI path: use browser UI for media posting (tweet/reply/quote) ---
+    if (config.mediaFiles.length > 0 && ['tweet', 'reply', 'quote'].includes(config.mode)) {
+      console.log('Media detected → using UI-based posting');
+      const tweetId = await postWithMediaUI(page, config);
+      console.log(`Tweet posted successfully${tweetId ? ` (id=${tweetId})` : ''}`);
+      return;
+    }
+
     // --- Extract GraphQL queryIds ---
     console.log('Extracting GraphQL queryIds from JS bundles...');
     const queryIds = await extractQueryIds(page);
@@ -826,7 +929,7 @@ async function main() {
       process.exit(1);
     }
 
-    // --- Upload media if any ---
+    // --- Upload media if any (thread only; tweet/reply/quote handled above) ---
     const mediaIds = [];
     if (config.mediaFiles.length > 0) {
       console.log(`Uploading ${config.mediaFiles.length} media file(s)...`);
